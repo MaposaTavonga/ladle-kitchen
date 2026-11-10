@@ -14,15 +14,20 @@ A cooking app for South African home cooks that teaches **why** things work. You
 
 ## Run it
 
-You need **Node.js 18 or newer** (https://nodejs.org) and a **Claude API key** (https://console.anthropic.com). API usage is billed to your account.
+You need **Node.js 18 or newer** (https://nodejs.org) and **one** AI key:
+
+- **Free:** a Google Gemini key from https://aistudio.google.com/apikey (set `AI_PROVIDER=gemini`)
+- **Paid:** a Claude API key from https://console.anthropic.com (set `AI_PROVIDER=claude`)
 
 ```bash
 # 1. in this folder, make your settings file
 cp .env.example .env          # Windows: copy .env.example .env
-# 2. open .env and paste your key after ANTHROPIC_API_KEY=
+# 2. open .env, set AI_PROVIDER and paste the matching key
 # 3. start it
 npm start
 ```
+
+The terminal tells you which AI and models are running. On Gemini's free tier Google may use your prompts to improve its products, so don't send anything private.
 
 Open **http://localhost:3000**. There's nothing to install: `server.js` only uses Node's built-in modules.
 
@@ -74,12 +79,16 @@ server.js         serves the files + forwards AI requests to the Claude API
 
 All AI calls go through two functions: `AI(input, opts)` for chat text and `AI.json(prompt, opts)` for structured answers. `opts.modelTier` picks the model, and you can change the mapping in `.env`:
 
-| tier | used for | default |
-|---|---|---|
-| `quick` | meal ideas, Chef chat, calorie estimates | `claude-haiku-5-5` |
-| `default` | full recipes, dish-photo analysis, fridge scan | `claude-sonnet-5-5` |
+| tier | used for | Gemini default | Claude default |
+|---|---|---|---|
+| `quick` | meal ideas, Chef chat, calorie estimates | `gemini-2.5-flash` | `claude-haiku-5-5` |
+| `default` | full recipes, dish-photo analysis, fridge scan | `gemini-2.5-flash` | `claude-sonnet-5-5` |
 
-The server adds images as base64 image blocks (JPG, PNG, GIF or WebP).
+`server.js` has one function per provider (`callGemini`, `callClaude`). To add another AI, write one more function that takes the same messages and returns `{ text, truncated }`. Images are sent as base64 (JPG, PNG, GIF or WebP).
+
+## Phone app (iPhone and Android)
+
+The native app lives in **`mobile/`** (Expo SDK 58). It uses this same server for the AI. In `.env` here, add `HOST=0.0.0.0` (and ideally a `LADLE_TOKEN` password), run `npm start`, then follow **`mobile/README.md`**.
 
 ## Going further
 - **Real accounts:** replace the `P` object's four functions (`getProfile`, `saveProfile`, `getDays`, `saveDay`) with a database.

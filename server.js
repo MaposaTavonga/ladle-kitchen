@@ -12,23 +12,56 @@ const fs = require('fs');
 const path = require('path');
 
 // ---- load .env (KEY=VALUE lines) without any package ----
+// Copes with how Windows editors save files: UTF-8 with or without BOM, UTF-16, CRLF line endings.
 const envFile = path.join(__dirname, '.env');
-if (fs.existsSync(envFile)) {
-  for (const line of fs.readFileSync(envFile, 'utf8').split(/\r?\n/)) {
-    const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/);
-    if (m && !process.env[m[1]]) process.env[m[1]] = m[2].replace(/^["']|["']$/g, '');
+const envFound = fs.existsSync(envFile);
+if (envFound) {
+  const buf = fs.readFileSync(envFile);
+  let text;
+  if (buf[0] === 0xFF && buf[1] === 0xFE) text = buf.slice(2).toString('utf16le');
+  else if (buf[0] === 0xFE && buf[1] === 0xFF) text = Buffer.from(buf.slice(2)).swap16().toString('utf16le');
+  else text = buf.toString('utf8');
+  text = text.replace(/^﻿/, '');
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const m = line.match(/^([A-Za-z0-9_]+)\s*=\s*(.*)$/);
+    if (!m) continue;
+    const key = m[1].toUpperCase();
+    const val = m[2].trim().replace(/^["']|["']$/g, '').trim();
+    if (val && !process.env[key]) process.env[key] = val;
   }
 }
 
 const PORT = Number(process.env.PORT) || 3000;
-const API_KEY = process.env.ANTHROPIC_API_KEY || '';
-// Which Claude model each "modelTier" in the app uses. Change these in .env.
-const MODELS = {
-  quick: process.env.MODEL_QUICK || 'claude-haiku-5-5',      // ideas, chat, calorie estimates
-  default: process.env.MODEL_DEFAULT || 'claude-sonnet-5-5', // full recipes, photo analysis
-  complex: process.env.MODEL_COMPLEX || 'claude-opus-5-5'
+// HOST=0.0.0.0 lets your phone reach the server over Wi-Fi (for Expo or the phone browser).
+// Leave it out to keep the server private to this computer.
+const HOST = process.env.HOST || '127.0.0.1';
+function lanAddresses() {
+  return Object.values(require('os').networkInterfaces()).flat()
+    .filter(a => a && a.family === 'IPv4' && !a.internal).map(a => a.address);
+}
+// Optional app password. If set, the phone app must send the same value
+// (EXPO_PUBLIC_LADLE_TOKEN in mobile/.env.local), so others on the Wi-Fi can't use your AI quota.
+const LADLE_TOKEN = process.env.LADLE_TOKEN || '';
+
+// Which AI to use: "gemini" (free tier) or "claude" (paid). Set AI_PROVIDER in .env.
+const PROVIDER = (process.env.AI_PROVIDER || (process.env.ANTHROPIC_API_KEY && !process.env.GEMINI_API_KEY ? 'claude' : 'gemini')).toLowerCase();
+const API_KEY = PROVIDER === 'gemini' ? (process.env.GEMINI_API_KEY || '') : (process.env.ANTHROPIC_API_KEY || '');
+const KEY_NAME = PROVIDER === 'gemini' ? 'GEMINI_API_KEY' : 'ANTHROPIC_API_KEY';
+
+// Which model each "modelTier" in the app uses. Change these in .env.
+const DEFAULT_MODELS = {
+  claude: { quick: 'claude-haiku-5-5', default: 'claude-sonnet-5-5', complex: 'claude-opus-5-5' },
+  gemini: { quick: 'gemini-2.5-flash', default: 'gemini-2.5-flash', complex: 'gemini-2.5-pro' }
 };
-const MAX_TOKENS = { quick: 2000, default: 8000, complex: 8000 };
+const MODELS = {
+  quick: process.env.MODEL_QUICK || DEFAULT_MODELS[PROVIDER]?.quick,     // ideas, chat, calorie estimates
+  default: process.env.MODEL_DEFAULT || DEFAULT_MODELS[PROVIDER]?.default, // full recipes, photo analysis
+  complex: process.env.MODEL_COMPLEX || DEFAULT_MODELS[PROVIDER]?.complex
+};
+const MAX_TOKENS = { quick: 4000, default: 8000, complex: 8000 }; // room for Gemini 2.5 "thinking" tokens too
+const JSON_RULE = 'Reply with only valid JSON that matches the requested shape. No markdown code fences, no commentary before or after.';
 
 const ROOT = __dirname;
 const TYPES = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
@@ -70,8 +103,53 @@ function toMessages(input, images) {
   return msgs;
 }
 
+function errorCode(status) {
+  return status === 429 || status === 529 || status === 503 ? 'rate_limited' : (status === 401 || status === 403) ? 'not_granted' : 'server_error';
+}
+
+// ---- Claude API ----
+async function callClaude(model, maxTokens, messages, json) {
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+    body: JSON.stringify({ model, max_tokens: maxTokens, messages, ...(json ? { system: JSON_RULE } : {}) })
+  });
+  const data = await r.json();
+  if (!r.ok) return { status: r.status, error: data?.error?.message || 'Claude API error' };
+  const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+  return { text, truncated: data.stop_reason === 'max_tokens' };
+}
+
+// ---- Google Gemini API (has a free tier: get a key at aistudio.google.com/apikey) ----
+async function callGemini(model, maxTokens, messages, json) {
+  const contents = messages.map(m => ({
+    role: m.role === 'assistant' ? 'model' : 'user',
+    parts: typeof m.content === 'string'
+      ? [{ text: m.content }]
+      : m.content.map(b => b.type === 'image'
+          ? { inline_data: { mime_type: b.source.media_type, data: b.source.data } }
+          : { text: b.text })
+  }));
+  const body = {
+    contents,
+    generationConfig: { maxOutputTokens: maxTokens, ...(json ? { responseMimeType: 'application/json' } : {}) },
+    ...(json ? { systemInstruction: { parts: [{ text: JSON_RULE }] } } : {})
+  };
+  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+    method: 'POST',
+    headers: { 'x-goog-api-key': API_KEY, 'content-type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const data = await r.json();
+  if (!r.ok) return { status: r.status, error: data?.error?.message || 'Gemini API error' };
+  const cand = (data.candidates || [])[0];
+  if (!cand) return { status: 400, code: 'refused', error: data?.promptFeedback?.blockReason || 'No answer returned' };
+  const text = (cand.content?.parts || []).map(p => p.text || '').join('');
+  return { text, truncated: cand.finishReason === 'MAX_TOKENS' };
+}
+
 async function handleSample(req, res) {
-  if (!API_KEY) return send(res, 500, { error: { code: 'not_granted', message: 'No ANTHROPIC_API_KEY set. Add it to your .env file.' } });
+  if (!API_KEY) return send(res, 500, { error: { code: 'not_granted', message: `No ${KEY_NAME} set. Add it to your .env file.` } });
   let body;
   try { body = JSON.parse(await readBody(req)); }
   catch (e) { return send(res, 400, { error: { code: 'bad_request', message: e.message === 'too_large' ? 'The request is too large.' : 'Invalid JSON.' } }); }
@@ -81,30 +159,17 @@ async function handleSample(req, res) {
   try { messages = toMessages(body.input, body.images); }
   catch (e) { return send(res, 400, { error: { code: 'bad_request', message: e.message } }); }
 
-  const payload = {
-    model: MODELS[tier],
-    max_tokens: MAX_TOKENS[tier],
-    messages,
-    ...(body.json ? { system: 'Reply with only valid JSON that matches the requested shape. No markdown code fences, no commentary before or after.' } : {})
-  };
-
+  const call = PROVIDER === 'gemini' ? callGemini : callClaude;
   try {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'x-api-key': API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    const data = await r.json();
-    if (!r.ok) {
-      const code = r.status === 429 || r.status === 529 ? 'rate_limited' : r.status === 401 ? 'not_granted' : 'server_error';
-      console.error('[Claude API]', r.status, data?.error?.message || data);
-      return send(res, r.status, { error: { code, message: data?.error?.message || 'Claude API error' } });
+    const out = await call(MODELS[tier], MAX_TOKENS[tier], messages, !!body.json);
+    if (out.error) {
+      console.error(`[${PROVIDER}]`, out.status, out.error);
+      return send(res, out.status, { error: { code: out.code || errorCode(out.status), message: out.error } });
     }
-    const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
-    send(res, 200, { text, truncated: data.stop_reason === 'max_tokens', model: data.model, usage: data.usage });
+    send(res, 200, { text: out.text, truncated: out.truncated, model: MODELS[tier] });
   } catch (e) {
-    console.error('[Claude API] request failed:', e.message);
-    send(res, 502, { error: { code: 'network', message: 'Could not reach the Claude API.' } });
+    console.error(`[${PROVIDER}] request failed:`, e.message);
+    send(res, 502, { error: { code: 'network', message: `Could not reach the ${PROVIDER} API.` } });
   }
 }
 
@@ -112,8 +177,9 @@ function serveStatic(req, res) {
   const urlPath = decodeURIComponent(new URL(req.url, 'http://x').pathname);
   const file = path.normalize(path.join(ROOT, urlPath === '/' ? 'index.html' : urlPath));
   const rel = path.relative(ROOT, file);
-  // only serve the app's own files: no ../, no .env, no server code
-  if (rel.startsWith('..') || path.isAbsolute(rel) || rel.split(path.sep).some(p => p.startsWith('.')) || rel === 'server.js' || !TYPES[path.extname(file)]) {
+  // only serve the web app's own files: no ../, no .env, no server code, nothing from the mobile project
+  const parts = rel.split(path.sep);
+  if (rel.startsWith('..') || path.isAbsolute(rel) || parts.some(p => p.startsWith('.')) || ['mobile', 'node_modules'].includes(parts[0]) || rel === 'server.js' || !TYPES[path.extname(file)]) {
     res.writeHead(404); return res.end('Not found');
   }
   fs.readFile(file, (err, buf) => {
@@ -124,11 +190,40 @@ function serveStatic(req, res) {
 }
 
 http.createServer((req, res) => {
-  if (req.url === '/api/health') return send(res, 200, API_KEY ? { ok: true } : { ok: false, error: 'No ANTHROPIC_API_KEY in .env' });
+  // let the Expo web preview (a different port) call the API too
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'content-type, x-ladle-token');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
+
+  // the password is only checked for other devices; the web app on this computer works without it
+  const fromThisComputer = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress);
+  if (req.url.startsWith('/api/') && LADLE_TOKEN && !fromThisComputer && req.headers['x-ladle-token'] !== LADLE_TOKEN) {
+    return send(res, 401, { ok: false, error: 'Wrong or missing app password. Set EXPO_PUBLIC_LADLE_TOKEN in mobile/.env.local to match LADLE_TOKEN.', code: 'unauthorized' });
+  }
+  if (req.url === '/api/health') return send(res, 200, API_KEY ? { ok: true, provider: PROVIDER } : { ok: false, error: `No ${KEY_NAME} in the server's .env` });
   if (req.url === '/api/sample' && req.method === 'POST') return handleSample(req, res);
   if (req.method === 'GET') return serveStatic(req, res);
   res.writeHead(405); res.end();
-}).listen(PORT, '127.0.0.1', () => {
-  console.log(`Ladle Kitchen running at http://localhost:${PORT}`);
-  if (!API_KEY) console.log('Warning: no ANTHROPIC_API_KEY found. Copy .env.example to .env and add your key to turn on the AI.');
+}).listen(PORT, HOST, () => {
+  console.log(`Ladle Kitchen running at http://localhost:${PORT}  (AI: ${PROVIDER}, models: ${MODELS.quick} / ${MODELS.default})`);
+  if (HOST === '0.0.0.0') {
+    const ips = lanAddresses();
+    if (ips.length) console.log(`On your phone (same Wi-Fi): ${ips.map(ip => `http://${ip}:${PORT}`).join('  or  ')}`);
+    console.log(LADLE_TOKEN
+      ? 'App password is on: phones must send the matching EXPO_PUBLIC_LADLE_TOKEN.'
+      : 'Anyone on this Wi-Fi can use the app (and your AI quota) while it runs. Set LADLE_TOKEN in .env to require a password.');
+  }
+  if (!API_KEY) {
+    if (!envFound) {
+      const lookalikes = fs.readdirSync(__dirname).filter(f => /^\.?env/i.test(f) && f !== '.env.example');
+      console.log(`\nNo .env file found in ${__dirname}`);
+      if (lookalikes.length) console.log(`Found ${lookalikes.join(', ')} instead. Rename it to exactly ".env".`);
+      else console.log('Create one: copy .env.example, rename the copy to ".env", then add your key.');
+    } else {
+      console.log(`\n.env was found, but ${KEY_NAME} is empty in it.`);
+      console.log(`Add a line like:  ${KEY_NAME}=your-key   (no spaces or quotes needed), save, and restart.`);
+    }
+    console.log('The app still runs, but the AI features are off until a key is set.\n');
+  }
 });

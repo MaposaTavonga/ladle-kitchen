@@ -1,0 +1,12 @@
+{
+  "name": "ladle-kitchen",
+  "version": "0.1.0",
+  "description": "Cooking app that teaches why things work: taste profile, budget meals, AI chef, calorie tracker.",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
